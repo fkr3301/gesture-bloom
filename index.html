@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no" />
+<meta name="theme-color" content="#07030c" />
+<meta name="description" content="手势控制花朵在指尖绽放：MediaPipe Hands 识别 21 个关键点，Three.js 粒子花朵随张合度实时开合。" />
+<title>指尖绽放 · 手势控制粒子花朵 (Three.js + MediaPipe Hands)</title>
+
+<link rel="stylesheet" href="./style.css" />
+
+<!--
+  ============================================================================
+  依赖引入说明（推荐：直接 ES Module + CDN，无需 npm / 无需构建）
+  ============================================================================
+  1) three            → 通过下面的 <script type="importmap"> 映射裸模块名 "three"
+  2) MediaPipe Hands  → 在 main.js 里用动态 import() 加载，因为它是 UMD 全局脚本
+                        （挂载 window.Hands / window.HAND_CONNECTIONS），
+                        不是标准 ES Module，所以不能用 import 语句。
+
+  国内加速：把下面 URL 里的 https://unpkg.com 换成 https://cdn.jsdelivr.net/npm
+  离线部署：把两个包下载到 ./vendor/ 下，再改写这里的路径（详见 README.md）
+  ============================================================================
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://registry.npmmirror.com/three/0.169.0/files/build/three.module.js",
+    "three/": "https://registry.npmmirror.com/three/0.169.0/files/"
+  }
+}
+</script>
+</head>
+
+<body>
+<!-- ==========================================================================
+     1. 摄像头画面（背景层，半透明叠加）
+     - 真实 <video> 元素，既作为背景显示，也直接作为 MediaPipe 的输入帧
+     - 通过 CSS transform: scaleX(-1) 做镜像，符合“照镜子”的直觉
+     - 只有在“手势模式”启动后才会显示（.is-live）
+     ========================================================================== -->
+<video id="camera" playsinline autoplay muted disablepictureinpicture></video>
+
+<!-- 背景叠加：径向渐变 + 暗角，保证粒子在明亮/杂乱背景下依然可读 -->
+<div class="backdrop" aria-hidden="true"></div>
+<div class="vignette" aria-hidden="true"></div>
+
+<!-- ==========================================================================
+     2. Three.js 渲染画布（WebGL，alpha:true 与摄像头画面叠加）
+     ========================================================================== -->
+<canvas id="gl"></canvas>
+
+<!-- ==========================================================================
+     3. 手部关键点连线覆盖层（2D Canvas，可开关）
+     ========================================================================== -->
+<canvas id="hand-overlay" aria-hidden="true"></canvas>
+
+<!-- ==========================================================================
+     4. HUD：标题 + 实时参数
+     ========================================================================== -->
+<header class="hud hud-tl">
+  <h1>指尖绽放 <span class="sub">Gesture Bloom</span></h1>
+  <p class="tagline">
+    握拳 <b>闭合花苞</b> · 张开 <b>粒子绽放</b> · 移动手掌 <b>牵引花心</b>
+  </p>
+
+  <div class="stat" id="stat-tension">
+    <div class="stat-row">
+      <span class="stat-label">tension 张合度</span>
+      <span class="stat-value" id="tension-value">0.00</span>
+    </div>
+    <div class="bar"><i id="tension-bar"></i></div>
+    <div class="stat-note" id="tension-stage">花苞闭合</div>
+  </div>
+
+  <div class="stat-row small">
+    <span>spread <b id="spread-value">0.00</b></span>
+    <span>fps <b id="fps-value">--</b></span>
+    <span>粒子 <b id="count-value">--</b></span>
+  </div>
+</header>
+
+<aside class="hud hud-tr" id="status-panel">
+  <div class="status-line">
+    <span class="dot" id="status-dot"></span>
+    <span id="status-text">待启动</span>
+  </div>
+  <div class="status-hint" id="status-hint">点击下方按钮开始</div>
+</aside>
+
+<!-- ==========================================================================
+     5. 控制面板（关键参数可调）
+     ========================================================================== -->
+<section class="hud hud-bottom" id="controls" hidden>
+  <div class="ctrl-group">
+    <button id="btn-mode" class="btn" type="button" title="在有摄像头手势 / 无摄像头指针之间切换">
+      切换为指针模式
+    </button>
+    <label class="switch">
+      <input type="checkbox" id="toggle-skeleton" checked />
+      <span>关键点连线</span>
+    </label>
+  </div>
+
+  <div class="ctrl-group grow">
+    <label class="slider">
+      <span>粒子数 <b id="out-particles">12000</b></span>
+      <input type="range" id="range-particles" min="3000" max="40000" step="1000" value="12000" />
+    </label>
+  </div>
+
+  <div class="ctrl-group grow">
+    <label class="slider">
+      <span>光晕半径 <b id="out-glow">1.00</b>×</span>
+      <input type="range" id="range-glow" min="0.4" max="2.4" step="0.05" value="1" />
+    </label>
+  </div>
+
+  <div class="ctrl-group">
+    <button id="btn-reset" class="btn ghost" type="button">恢复默认</button>
+  </div>
+</section>
+
+<!-- ==========================================================================
+     6. 启动遮罩（必须由用户手势触发，才能稳定拿到摄像头权限 + 音频/视频自动播放）
+     ========================================================================== -->
+<div class="boot" id="boot">
+  <div class="boot-card">
+    <div class="bloom-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <h2>指尖绽放</h2>
+    <p class="boot-desc">
+      用摄像头识别你的手：<b>握拳</b>花朵聚为花苞，<b>张开五指</b>粒子向外绽放。
+    </p>
+
+    <label class="switch boot-switch">
+      <input type="checkbox" id="toggle-camera" checked />
+      <span>启用手势识别（需要摄像头权限）</span>
+    </label>
+
+    <div class="boot-actions">
+      <button id="btn-start" class="btn primary" type="button">开始（允许摄像头）</button>
+      <button id="btn-mouse" class="btn ghost" type="button">不用摄像头，用指针</button>
+    </div>
+
+    <!-- 进度 / 错误提示：点击开始后每一步都会更新这里，失败时给出具体原因与下一步怎么做 -->
+    <p class="boot-hint" id="boot-hint" role="status" aria-live="polite"></p>
+
+    <ul class="boot-notes">
+      <li>摄像头画面只在本机浏览器内处理，不会上传到任何服务器。</li>
+      <li>页面必须通过 <code>http://localhost</code> / <code>https://</code> 打开（<code>file://</code> 无法调用摄像头）。</li>
+      <li>点了「开始」很久没反应？多半是加载不到 CDN（three / mediapipe），或权限弹窗被浏览器拦住 —— 看上面的提示即可，也可以直接点「不用摄像头，用指针」先玩。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- 词法作用域入口：ES Module，必须放在 body 末尾 -->
+<script type="module" src="./main.js"></script>
+</body>
+</html>
